@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Magicboard</string>
+    <string name="clear">Clear</string>
+    <string name="eraser">Eraser</string>
+    <string name="palette">Palette</string>
+    <string name="mode_toggle">Mode toggle</string>
+</resources>

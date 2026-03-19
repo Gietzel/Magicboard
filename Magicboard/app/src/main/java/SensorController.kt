@@ -19,13 +19,17 @@ class SensorController(
     companion object {
         private const val TAG = "MAGIC_TRICK"
 
-        // tuning constants (adjust if needed)
-        private const val FACE_DOWN_THRESHOLD = 1.0f   // mag < this => considered "still on table"
-        private const val LIFT_THRESHOLD = 1.2f        // mag > this => started lifting
-        private const val SHAKE_THRESHOLD = 18f        // mag > this => shake peak
-        private const val STILL_TIME = 3000L           // must be still on table this long to become READY
-        private const val HOLD_TIME = 2000L            // hold window after lift start
-        private const val REQUIRED_SHAKE_COUNT = 3
+        private const val FACE_DOWN_THRESHOLD = 1.0f
+        private const val LIFT_THRESHOLD = 1.2f
+
+        private const val REVEAL_THRESHOLD = 3.0f
+        private const val REVEAL_STABLE_MS = 150L
+
+        private const val MIN_DECISION_MS = 700L
+        private const val HOLD_TIME = 2000L
+
+        private const val SHAKE_THRESHOLD = 15.0f
+        private const val SHAKE_DEBOUNCE_MS = 120L
     }
 
     private val sensorManager =
@@ -34,21 +38,28 @@ class SensorController(
     private val accel = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
     private val handler = Handler(Looper.getMainLooper())
 
-    private enum class State { IDLE, WAIT_FACE_DOWN, READY, LIFTING }
-    private var state = State.IDLE
+    private enum class State {
+        IDLE,
+        WAIT_FACE_DOWN,
+        READY,
+        LIFTING
+    }
 
+    private var state = State.IDLE
     private var stillnessPending = false
+
     private var liftStart = 0L
     private var holdComplete = false
-    private var shakeCount = 0
+    private var shakeSeen = false
     private var liftSide = 0
+    private var revealSince = 0L
+    private var lastShakePeak = 0L
 
     private val stillnessRunnable = Runnable {
-        // only promote if still waiting and stillness was not cancelled
         if (state == State.WAIT_FACE_DOWN && stillnessPending) {
             state = State.READY
             stillnessPending = false
-            Log.d(TAG, "STILLNESS OK -> TRICK READY")
+            Log.d(TAG, "STILLNESS OK -> READY")
         }
     }
 
@@ -62,23 +73,23 @@ class SensorController(
     fun stop() {
         sensorManager.unregisterListener(this)
         handler.removeCallbacksAndMessages(null)
+        resetGesture()
         state = State.IDLE
-        stillnessPending = false
         Log.d(TAG, "sensors stopped")
     }
 
     fun armTrick() {
-        Log.d(TAG, "ARM: entering WAIT_FACE_DOWN")
+        Log.d(TAG, "ARM -> WAIT_FACE_DOWN")
         handler.removeCallbacksAndMessages(null)
+        resetGesture()
         state = State.WAIT_FACE_DOWN
-        stillnessPending = false
     }
 
     fun disarmTrick() {
         Log.d(TAG, "DISARM")
         handler.removeCallbacksAndMessages(null)
+        resetGesture()
         state = State.IDLE
-        stillnessPending = false
     }
 
     override fun onSensorChanged(event: SensorEvent) {
@@ -89,24 +100,22 @@ class SensorController(
         val z = event.values[2]
         val mag = sqrt(x * x + y * y)
 
-        Log.d(TAG, "state=$state mag=${"%.2f".format(mag)} x=${"%.2f".format(x)} y=${"%.2f".format(y)} z=${"%.2f".format(z)} shakes=$shakeCount")
+        Log.d(
+            TAG,
+            "state=$state mag=${"%.2f".format(mag)} x=${"%.2f".format(x)} y=${"%.2f".format(y)} z=${"%.2f".format(z)} shakes=$shakeSeen"
+        )
 
         when (state) {
-            State.IDLE -> {
-                // do nothing
-            }
+            State.IDLE -> Unit
 
             State.WAIT_FACE_DOWN -> {
-                // must be relatively still (low mag) to start the stillness timer
                 if (mag < FACE_DOWN_THRESHOLD) {
                     if (!stillnessPending) {
                         stillnessPending = true
-                        handler.postDelayed(stillnessRunnable, STILL_TIME)
+                        handler.postDelayed(stillnessRunnable, 3000L)
                         Log.d(TAG, "FACE DOWN candidate -> starting stillness timer")
                     }
-                    // if stillnessPending true, keep waiting; do not change state yet
                 } else {
-                    // movement observed while waiting -> cancel pending stillness
                     if (stillnessPending) {
                         stillnessPending = false
                         handler.removeCallbacks(stillnessRunnable)
@@ -116,70 +125,90 @@ class SensorController(
             }
 
             State.READY -> {
-                // Now we only consider a real lift when mag exceeds LIFT_THRESHOLD
                 if (mag > LIFT_THRESHOLD) {
                     liftStart = System.currentTimeMillis()
                     holdComplete = false
-                    shakeCount = 0
+                    shakeSeen = false
+                    revealSince = 0L
+                    lastShakePeak = 0L
+
                     liftSide = detectSide(x, y)
                     state = State.LIFTING
+
                     handler.postDelayed({
                         if (state == State.LIFTING) {
                             holdComplete = true
-                            Log.d(TAG, "HOLD window elapsed -> holdComplete=true")
+                            Log.d(TAG, "HOLD_COMPLETE")
                         }
                     }, HOLD_TIME)
-                    Log.d(TAG, "LIFT DETECTED side=$liftSide")
+
+                    Log.d(TAG, "LIFT_START side=$liftSide")
                 }
             }
 
             State.LIFTING -> {
-                // count strong peaks as shakes
-                if (mag > SHAKE_THRESHOLD) {
-                    shakeCount++
-                    Log.d(TAG, "SHAKE_PEAK #$shakeCount (mag=${"%.1f".format(mag)})")
+                val now = System.currentTimeMillis()
+                val elapsed = now - liftStart
+
+                if (!holdComplete && elapsed >= HOLD_TIME) {
+                    holdComplete = true
+                    Log.d(TAG, "HOLD_COMPLETE (fallback)")
                 }
 
-                // when user places phone back down (mag falls below face-down threshold)
-                if (mag < FACE_DOWN_THRESHOLD) {
-                    val result = decideNumber()
-                    Log.d(TAG, "PICKUP-END -> result=$result")
-                    onPrediction(result)
-                    // reset
-                    handler.removeCallbacksAndMessages(null)
-                    state = State.IDLE
-                    stillnessPending = false
+                if (mag > SHAKE_THRESHOLD && now - lastShakePeak > SHAKE_DEBOUNCE_MS) {
+                    shakeSeen = true
+                    lastShakePeak = now
+                    Log.d(TAG, "SHAKE_PEAK (mag=${"%.1f".format(mag)})")
+                }
+
+                if (mag >= REVEAL_THRESHOLD) {
+                    if (revealSince == 0L) {
+                        revealSince = now
+                        Log.d(TAG, "REVEAL started")
+                    }
+
+                    val stableReveal = now - revealSince >= REVEAL_STABLE_MS
+                    val decisionWindowReady = elapsed >= MIN_DECISION_MS
+
+                    if (stableReveal && decisionWindowReady) {
+                        val result = decideNumber()
+                        Log.d(TAG, "RESULT=$result")
+                        onPrediction(result)
+
+                        handler.removeCallbacksAndMessages(null)
+                        resetGesture()
+                        state = State.IDLE
+                        Log.d(TAG, "RESET -> IDLE")
+                    }
+                } else {
+                    revealSince = 0L
                 }
             }
         }
     }
 
     private fun detectSide(x: Float, y: Float): Int {
-        // 1 = TOP, 2 = LEFT, 3 = BOTTOM, 4 = RIGHT
-        return if (abs(x) > abs(y)) {
-            if (x > 0f) 4 else 2 // sign conventions may vary by device; adjust if needed
+        return if (abs(x) >= abs(y)) {
+            if (x < 0f) 2 else 4
         } else {
-            if (y > 0f) 3 else 1
+            if (y > 0f) 1 else 3
         }
     }
 
     private fun decideNumber(): Int {
-        // shake priority (apply to top/bottom; mapping uses liftSide convention)
-        if (shakeCount >= REQUIRED_SHAKE_COUNT) {
-            return when (liftSide) {
+        return if (shakeSeen) {
+            when (liftSide) {
                 1 -> 9
                 3 -> 10
-                else -> fallback()
+                else -> fallbackQuickOrHold()
             }
-        }
-        // hold vs quick
-        return if (holdComplete) {
+        } else if (holdComplete) {
             when (liftSide) {
                 1 -> 5
                 2 -> 6
                 3 -> 7
                 4 -> 8
-                else -> fallback()
+                else -> 5
             }
         } else {
             when (liftSide) {
@@ -187,12 +216,24 @@ class SensorController(
                 2 -> 2
                 3 -> 3
                 4 -> 4
-                else -> fallback()
+                else -> 1
             }
         }
     }
 
-    private fun fallback(): Int = 1
+    private fun fallbackQuickOrHold(): Int {
+        return if (holdComplete) 5 else 1
+    }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    private fun resetGesture() {
+        stillnessPending = false
+        liftStart = 0L
+        holdComplete = false
+        shakeSeen = false
+        liftSide = 0
+        revealSince = 0L
+        lastShakePeak = 0L
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 }

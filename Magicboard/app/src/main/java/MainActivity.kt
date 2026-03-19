@@ -70,6 +70,11 @@ class MainActivity : AppCompatActivity() {
 
         clearButton.setOnClickListener {
             drawingView.clearCanvas()
+
+            if (modeActive) {
+                sensorController.armTrick()
+                updateModeVisual(true)
+            }
         }
 
         eraserButton.setOnClickListener {
